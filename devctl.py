@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """devctl: start/stop docker compose stacks and npm daemons from one terminal menu."""
-import curses, locale, os, re, shlex, subprocess, sys, time, tomllib
+import curses, json, locale, os, re, shlex, subprocess, sys, time, tomllib
 from pathlib import Path
 
 SESSION = os.environ.get("DEVCTL_SESSION", "devctl")
 CONFIG = Path(os.environ.get("DEVCTL_CONFIG", Path(__file__).resolve().parent / "services.toml"))
+STATE = Path(os.environ.get("DEVCTL_STATE", Path.home() / ".local/state/devctl/worktrees.json"))
 KINDS = ("npm", "compose", "cmd")
 TMUX_CMD = ("tmux", "-L", SESSION)  # dedicated server: Esc binding can't leak into the user's own tmux
 SETUP = (";", "bind", "-n", "Escape", "detach-client", ";", "set", "-g", "escape-time", "10",
@@ -36,7 +37,7 @@ class Service:
         if "dir" not in spec:
             raise ConfigError(f"{name}: dir manquant")
         self.name, self.kind = name, kinds[0]
-        self.dir = Path(spec["dir"]).expanduser().resolve()
+        self.dir = self.base_dir = Path(spec["dir"]).expanduser().resolve()  # dir moves with worktrees
         if not self.dir.is_dir():
             raise ConfigError(f"{name}: dir introuvable ({self.dir})")
         self.files = files
@@ -117,6 +118,8 @@ class Tmux:
                 for name, dead in (line.rsplit(" ", 1) for line in r.stdout.splitlines())}
 
     def start(self, svc):
+        if not svc.dir.is_dir():
+            return f"dossier introuvable ({svc.dir})"
         sh(*TMUX_CMD, "kill-window", "-t", self.target(svc))  # drop a dead window, no-op otherwise
         if sh(*TMUX_CMD, "has-session", "-t", f"={SESSION}").returncode == 0:
             new = ["new-window", "-d", "-t", f"={SESSION}:"]
@@ -235,7 +238,11 @@ def rebase_on_main(repo):
     main = main_branch(repo)
     if git(repo, "branch", "--show-current").stdout.strip() == main:
         return pull(repo)
-    err = error(git(repo, "fetch", "origin", f"{main}:{main}"))
+    holder = worktrees(repo).get(main)
+    if holder and holder != repo_of(repo):
+        err = pull(holder)  # git won't fetch into a branch checked out elsewhere: pull it there
+    else:
+        err = error(git(repo, "fetch", "origin", f"{main}:{main}"))
     if err:
         return err
     if git(repo, "rebase", "--autostash", main).returncode:
@@ -254,6 +261,85 @@ def branches(repo):
         if name not in ("HEAD", "origin") and name not in names:
             names.append(name)
     return names
+
+
+def worktrees(repo):
+    """{branch: worktree dir}, the main folder included."""
+    out, path = {}, None
+    for line in git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line.removeprefix("worktree ")).resolve()
+        elif line.startswith("branch refs/heads/"):
+            out[line.removeprefix("branch refs/heads/")] = path
+    return out
+
+
+def group_homes(services, groups):
+    """{group: main folder} for groups whose members all live in one git repo."""
+    homes = {}
+    for g, members in groups.items():
+        repos = {repo_of(services[m].base_dir) for m in members} - {None}
+        if len(repos) == 1:
+            homes[g] = repos.pop()
+    return homes
+
+
+def relocate(svc, home, loc):
+    """npm/cmd services follow the group's worktree; docker stays in the main folder."""
+    if svc.engine is TMUX:
+        try:
+            svc.dir = loc / svc.base_dir.relative_to(home)
+        except ValueError:
+            pass
+
+
+def save_state(homes, locs):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps({g: str(l) for g, l in locs.items() if l != homes.get(g)}, indent=2))
+
+
+def restore_locations(services, groups, homes):
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    locs, notes = {}, []
+    for g, home in homes.items():
+        loc = Path(state[g]) if isinstance(state.get(g), str) else home
+        if not loc.is_dir():
+            notes.append(f"{g} : worktree {loc.name} introuvable, retour au dossier principal")
+            loc = home
+        locs[g] = loc
+        for m in groups[g]:
+            relocate(services[m], home, loc)
+    if notes:
+        save_state(homes, locs)
+    return locs, notes
+
+
+def switch_group(group, branch, services, groups, homes, locs, states, show=print):
+    """Run the group's npm/cmd services from the worktree holding `branch`, else check it out in the
+    main folder. Running daemons restart only when their folder changes. Returns errors."""
+    home = homes[group]
+    holder = worktrees(home).get(branch)
+    if holder and holder != home:
+        loc = holder
+    else:
+        loc = home
+        if git(home, "branch", "--show-current").stdout.strip() != branch:
+            err = checkout(home, branch)
+            if err:
+                return [f"{group}: {err}"]
+    if loc == locs[group]:
+        return []
+    members = [services[m] for m in groups[group]]
+    running = [s for s in members if s.engine is TMUX and states.get(s.name) == "up"]
+    errors = apply([("stop", s) for s in running], show)
+    locs[group] = loc
+    for s in members:
+        relocate(s, home, loc)
+    save_state(homes, locs)
+    return errors + apply([("start", s) for s in running], show)
 
 
 def checkout(repo, branch):
@@ -407,13 +493,17 @@ def tui(scr, services, groups):
         curses.init_pair(i, c, -1)
     scr.timeout(2000)
     rows, prefixes = map(list, zip(*layout(services, groups)))
-    repos = {name: row_repos(name, services, groups) for name in set(rows)}
-    cur, marked, msg, stale, git_stale = 0, set(), HELP, True, True
+    homes = group_homes(services, groups)
+    locs, notes = restore_locations(services, groups, homes)
+    cur, marked, msg, stale, git_stale = 0, set(), " · ".join(notes) or HELP, True, True
     while True:
         if stale:  # only on timer/actions: refreshing per keypress makes held arrows lag
             states, stale = all_states(services), False
         if git_stale:  # git status is slow on big repos: only at startup, after git actions and on r
-            labels = {n: git_label(repos[n]) for n, p in zip(rows, prefixes) if not p}
+            # a group's git actions target its current folder (main folder or worktree)
+            repos = {n: [locs[n]] if n in homes else row_repos(n, services, groups) for n in set(rows)}
+            labels = {n: git_label(repos[n]) + (" (worktree)" if n in homes and locs[n] != homes[n] else "")
+                      for n, p in zip(rows, prefixes) if not p}
             git_stale = False
         show = lambda m: draw(scr, rows, prefixes, cur, marked, services, groups, states, labels, m)
         show(msg)
@@ -457,6 +547,15 @@ def tui(scr, services, groups):
             elif key == ord("m"):
                 if confirm(scr, show, f"Mettre à jour main et rebaser {rows[cur]} dessus ?"):
                     errors = git_each(row_repo, rebase_on_main, show, "rebase")
+            elif group := next((g for g in homes if rows[cur] == g or rows[cur] in groups[g]), None):
+                home, wts = homes[group], worktrees(homes[group])
+                tags = {b: "worktree" if wts.get(b, home) != home else
+                        "dossier principal" if b in wts else "checkout dossier principal" for b in branches(home)}
+                display = {f"{b:<50} {tag}": b for b, tag in tags.items()}
+                choice = pick(scr, f"branche de {group}", list(display))
+                if choice:
+                    errors = switch_group(group, display[choice], services, groups, homes, locs, states, show)
+                    stale = True
             elif len(row_repo) > 1:
                 errors = [f"{rows[cur]} : plusieurs repos, choisis la ligne d'un service"]
             else:
@@ -484,6 +583,9 @@ def main(argv):
         sys.exit(f"devctl: {CONFIG}: {e}")
     if not services:
         sys.exit(f"devctl: aucun service dans {CONFIG}")
+    if argv:  # the TUI restores worktree locations itself
+        for note in restore_locations(services, groups, group_homes(services, groups))[1]:
+            print(note, file=sys.stderr)
     if argv == ["--check"]:
         states = all_states(services)
         for s in services.values():

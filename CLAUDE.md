@@ -25,6 +25,8 @@ Pour proposer des services, inspecter les projets de l'utilisateur :
 - `package-scripts.js` (nps) → `cmd = "npx nps <raccourci>"`.
 - Grouper l'env docker et les daemons d'un même projet.
 
+Les groupes dont tous les membres sont dans un même repo peuvent basculer sur un worktree git (les services npm/cmd suivent, docker reste dans le dossier principal) : garder les services d'un même repo dans un groupe.
+
 Valider avec `devctl --check` (exit 1 + message si la config est invalide).
 
 ## Dev

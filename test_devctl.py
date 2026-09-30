@@ -2,6 +2,7 @@ import os, subprocess, tempfile, time, unittest
 from pathlib import Path
 
 os.environ["DEVCTL_SESSION"] = "devctl-test"
+os.environ["DEVCTL_STATE"] = str(Path(tempfile.mkdtemp()) / "state.json")
 import devctl
 
 
@@ -176,7 +177,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("services.example.toml", str(e.exception.code))
 
 
-class GitTest(unittest.TestCase):
+class GitFixture(unittest.TestCase):
     def setUp(self):
         from unittest import mock
         env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
@@ -203,6 +204,7 @@ class GitTest(unittest.TestCase):
         self.git(repo, "commit", "-q", "-m", f"{name}={content}")
 
     def push_from_other(self, name, content, branch="main"):
+        self.git(self.other, "fetch", "-q")
         self.git(self.other, "checkout", "-q", "-B", branch, "origin/main")
         self.commit(self.other, name, content)
         self.git(self.other, "push", "-q", "origin", f"{branch}:{branch}")
@@ -210,6 +212,13 @@ class GitTest(unittest.TestCase):
     def branch(self):
         return self.git(self.repo, "branch", "--show-current").strip()
 
+    def add_worktree(self, branch):
+        wt = self.repo / ".claude" / "worktrees" / branch.replace("/", "+")
+        self.git(self.repo, "worktree", "add", "-q", "-b", branch, str(wt))
+        return wt.resolve()
+
+
+class GitTest(GitFixture):
     def test_repo_of_subdir_and_non_repo(self):
         (self.repo / "api").mkdir()
         self.assertEqual(devctl.repo_of(self.repo / "api"), self.repo.resolve())
@@ -351,3 +360,134 @@ class PopupTest(unittest.TestCase):
 
     def test_escape_cancels(self):
         self.assertIsNone(self.popup([27]))
+
+
+class WorktreeTest(GitFixture):
+    def setUp(self):
+        super().setUp()
+        devctl.STATE.unlink(missing_ok=True)
+        (self.repo / "api").mkdir()
+        (self.repo / "api" / "x").write_text("x")
+        self.git(self.repo, "add", "api"); self.git(self.repo, "commit", "-q", "-m", "api")
+        self.git(self.repo, "push", "-q")
+        self.services = {"db": devctl.Service("db", {"dir": str(self.repo), "compose": True}),
+                         "api": devctl.Service("api", {"dir": str(self.repo / "api"), "npm": "dev"}),
+                         "front": devctl.Service("front", {"dir": str(self.repo), "cmd": "true"})}
+        self.groups = {"g": ["db", "api", "front"]}
+        self.homes = devctl.group_homes(self.services, self.groups)
+        self.home = self.repo.resolve()
+
+    def switch(self, branch, states, locs=None):
+        from unittest import mock
+        locs = locs or {"g": self.home}
+        with mock.patch.object(devctl, "apply", return_value=[]) as apply:
+            errors = devctl.switch_group("g", branch, self.services, self.groups, self.homes, locs, states, lambda m: None)
+        actions = [[(a, s.name) for a, s in c.args[0]] for c in apply.call_args_list]
+        return errors, locs, [x for batch in actions for x in batch]
+
+    def test_group_homes_single_repo_only(self):
+        self.assertEqual(self.homes, {"g": self.home})
+        other = {"x": devctl.Service("x", {"dir": str(self.tmp), "cmd": "true"})}
+        self.assertEqual(devctl.group_homes({**self.services, **other}, {"g": ["db", "x"], "h": ["x"]}), {"g": self.home})
+
+    def test_worktrees_maps_branches_to_dirs(self):
+        wt = self.add_worktree("feat/x")
+        self.assertEqual(devctl.worktrees(self.repo), {"main": self.home, "feat/x": wt})
+
+    def test_switch_to_worktree_moves_npm_restarts_running_only_keeps_docker(self):
+        wt = self.add_worktree("feat/x")
+        errors, locs, actions = self.switch("feat/x", {"api": "up", "db": "up"})
+        self.assertEqual(errors, [])
+        self.assertEqual(locs["g"], wt)
+        self.assertEqual(self.services["api"].dir, wt / "api")
+        self.assertEqual(self.services["front"].dir, wt)
+        self.assertEqual(self.services["db"].dir, self.home)  # docker stays in the main folder
+        self.assertEqual(actions, [("stop", "api"), ("start", "api")])
+        self.assertEqual(self.git(self.repo, "branch", "--show-current").strip(), "main")  # no checkout
+
+    def test_switch_back_to_main_returns_home_and_checks_out_main(self):
+        wt = self.add_worktree("feat/x")
+        self.git(self.repo, "checkout", "-q", "-b", "other")
+        _, locs, _ = self.switch("feat/x", {})
+        errors, locs, _ = self.switch("main", {}, locs)
+        self.assertEqual(errors, [])
+        self.assertEqual(locs["g"], self.home)
+        self.assertEqual(self.services["api"].dir, self.home / "api")
+        self.assertEqual(self.git(self.repo, "branch", "--show-current").strip(), "main")
+
+    def test_branch_without_worktree_is_checked_out_in_main_folder(self):
+        self.git(self.repo, "branch", "fix")
+        errors, locs, actions = self.switch("fix", {"api": "up"})
+        self.assertEqual(errors, [])
+        self.assertEqual(locs["g"], self.home)
+        self.assertEqual(actions, [])  # same folder: dev servers reload by themselves
+        self.assertEqual(self.git(self.repo, "branch", "--show-current").strip(), "fix")
+
+    def test_location_persists_and_missing_worktree_falls_back(self):
+        wt = self.add_worktree("feat/x")
+        self.switch("feat/x", {})
+        fresh = {n: devctl.Service(n, {"dir": str(s.base_dir), **{s.kind: s.command or True}})
+                 for n, s in self.services.items() if s.kind != "npm"}
+        fresh["api"] = devctl.Service("api", {"dir": str(self.repo / "api"), "npm": "dev"})
+        locs, notes = devctl.restore_locations(fresh, self.groups, self.homes)
+        self.assertEqual((locs["g"], fresh["api"].dir, notes), (wt, wt / "api", []))
+        self.git(self.repo, "worktree", "remove", "--force", str(wt))
+        fresh["api"] = devctl.Service("api", {"dir": str(self.repo / "api"), "npm": "dev"})
+        locs, notes = devctl.restore_locations(fresh, self.groups, self.homes)
+        self.assertEqual(locs["g"], self.home)
+        self.assertEqual(fresh["api"].dir, self.home / "api")
+        self.assertEqual(len(notes), 1)
+
+    def test_rebase_on_main_from_worktree_updates_main_in_main_folder(self):
+        wt = self.add_worktree("feat/x")
+        self.commit(wt, "f.txt", "feat")
+        self.push_from_other("c.txt", "main2")
+        self.assertIsNone(devctl.rebase_on_main(wt))
+        self.assertEqual((self.repo / "c.txt").read_text(), "main2")  # main folder pulled
+        self.assertEqual((wt / "c.txt").read_text(), "main2")
+
+
+class TmuxMissingDirTest(unittest.TestCase):
+    def tearDown(self):
+        subprocess.run(["tmux", "-L", "devctl-test", "kill-server"], capture_output=True)
+
+    def test_start_in_missing_dir_is_an_error(self):
+        s = devctl.Service("a", {"dir": "/tmp", "cmd": "sleep 1000"})
+        s.dir = Path("/nope/nope")
+        self.assertIn("introuvable", devctl.TMUX.start(s))
+
+
+class TuiWorktreeTest(unittest.TestCase):
+    def run_tui(self, keys, rows_down=0):
+        import curses
+        from unittest import mock
+        home, wt = Path("/r"), Path("/r/.claude/worktrees/feat")
+        scr = mock.Mock(getch=mock.Mock(side_effect=[curses.KEY_DOWN] * rows_down + keys + [ord("q")]),
+                        getmaxyx=mock.Mock(return_value=(24, 80)))
+        services = {"api": devctl.Service("api", {"dir": "/tmp", "npm": "dev"})}
+        self.seen = []
+        def pick(scr, title, items):
+            self.seen = items
+            return next(i for i in items if i.startswith("feat"))
+        m = dict(all_states=mock.Mock(return_value={}), row_repos=mock.Mock(return_value=[home]),
+                 git_label=mock.Mock(return_value="⎇ main"), group_homes=mock.Mock(return_value={"g": home}),
+                 restore_locations=mock.Mock(return_value=({"g": home}, [])),
+                 worktrees=mock.Mock(return_value={"main": home, "feat": wt}),
+                 branches=mock.Mock(return_value=["feat", "main", "fix"]), pick=pick,
+                 switch_group=mock.Mock(return_value=[]), checkout=mock.Mock(return_value=None))
+        with mock.patch.multiple(curses, curs_set=mock.DEFAULT, use_default_colors=mock.DEFAULT,
+                                 init_pair=mock.DEFAULT, color_pair=mock.Mock(return_value=0)), \
+             mock.patch.multiple(devctl, **m):
+            devctl.tui(scr, services, {"g": ["api"]})
+        return m
+
+    def test_branch_on_group_switches_worktree_with_tagged_list(self):
+        m = self.run_tui([ord("b")])
+        self.assertEqual(m["switch_group"].call_args.args[:2], ("g", "feat"))
+        m["checkout"].assert_not_called()
+        tags = {i.split()[0]: " ".join(i.split()[1:]) for i in self.seen}
+        self.assertEqual(tags, {"feat": "worktree", "main": "dossier principal", "fix": "checkout dossier principal"})
+
+    def test_branch_on_member_row_acts_for_its_group(self):
+        m = self.run_tui([ord("b")], rows_down=1)
+        self.assertEqual(m["switch_group"].call_args.args[:2], ("g", "feat"))
