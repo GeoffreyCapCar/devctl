@@ -1,0 +1,4 @@
+__pycache__/
+services.toml
+.superpowers
+docs/superpowers/*

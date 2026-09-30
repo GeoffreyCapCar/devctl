@@ -1,0 +1,35 @@
+# Exemple de config devctl — copie-le en services.toml (gitignoré) et adapte.
+# Un service = dir + (npm | compose | cmd). Format complet : CLAUDE.md
+
+[services.monolith-docker]
+dir = "~/code/monolith"
+compose = true                 # docker compose up -d / down
+
+[services.monolith-api]
+dir = "~/code/monolith/api"
+npm = "start:dev"              # npm run start:dev, dans tmux
+
+[services.monolith-front]
+dir = "~/code/monolith/front"
+npm = "dev"
+
+[services.monolith-worker]
+dir = "~/code/monolith/api"
+cmd = "npx nps worker"         # commande shell libre, dans tmux
+
+[services.blog-docker]
+dir = "~/code/blog"
+compose = true
+compose_files = ["docker-compose.yml", "docker-compose.override.yml"]
+
+[services.blog-front]
+dir = "~/code/blog"
+npm = "dev"
+
+[services.mailcatcher]
+dir = "~"
+cmd = "docker run --rm -p 1080:1080 -p 1025:1025 dockage/mailcatcher"
+
+[groups]
+monolith = ["monolith-docker", "monolith-api", "monolith-front", "monolith-worker"]
+blog = ["blog-docker", "blog-front"]
