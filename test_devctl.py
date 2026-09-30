@@ -151,7 +151,7 @@ class TuiTest(unittest.TestCase):
             devctl.tui(scr, services, {})
         self.assertEqual(states.call_count, 1)
 
-    def test_enter_toggles_like_space(self):
+    def test_space_toggles_and_enter_menu_first_entry_toggles(self):
         import curses
         from unittest import mock
         services = {"a": devctl.Service("a", {"dir": "/tmp", "cmd": "true"})}
@@ -160,9 +160,11 @@ class TuiTest(unittest.TestCase):
             with mock.patch.multiple(curses, curs_set=mock.DEFAULT, use_default_colors=mock.DEFAULT,
                                      init_pair=mock.DEFAULT, color_pair=mock.Mock(return_value=0)), \
                  mock.patch.object(devctl, "all_states", return_value={}), \
-                 mock.patch.object(devctl, "apply", return_value=[]) as apply:
+                 mock.patch.object(devctl, "apply", return_value=[]) as apply, \
+                 mock.patch.object(devctl, "popup", return_value=0) as popup:
                 devctl.tui(scr, services, {})
             self.assertEqual([(a, s.name) for a, s in apply.call_args[0][0]], [("start", "a")], key)
+            self.assertEqual(popup.called, key != ord(" "))
 
 
 class MainTest(unittest.TestCase):
@@ -296,3 +298,56 @@ class PickTest(unittest.TestCase):
 
     def test_enter_on_empty_result_cancels(self):
         self.assertIsNone(self.pick(["z", "z", "\n"], ["main"]))
+
+
+class MenuTest(unittest.TestCase):
+    def setUp(self):
+        self.services = {"api": devctl.Service("api", {"dir": "/tmp", "npm": "dev"}),
+                         "db": devctl.Service("db", {"dir": "/tmp", "compose": True})}
+        self.groups = {"g": ["db", "api"]}
+
+    def labels(self, name, states, repos, marked=()):
+        return [label for label, _ in devctl.menu_items(name, self.services, self.groups, states, repos, marked)]
+
+    def test_running_service_in_repo(self):
+        self.assertEqual(self.labels("api", {"api": "up"}, [Path("/r")]),
+                         ["Arrêter", "Voir le terminal", "Changer de branche…", "Pull", "Rebase sur main…",
+                          "Tout démarrer…", "Tout arrêter…"])
+
+    def test_stopped_compose_outside_git(self):
+        self.assertEqual(self.labels("db", {}, []), ["Démarrer", "Voir les logs", "Tout démarrer…", "Tout arrêter…"])
+
+    def test_crashed_service_offers_restart(self):
+        self.assertEqual(self.labels("api", {"api": "dead"}, [])[0], "Relancer")
+
+    def test_partial_group_with_two_repos_has_no_branch_switch(self):
+        labels = self.labels("g", {"db": "up"}, [Path("/r1"), Path("/r2")])
+        self.assertEqual(labels[:3], ["Démarrer le groupe", "Pull", "Rebase sur main…"])
+
+    def test_selection_replaces_row_toggle(self):
+        self.assertEqual(self.labels("api", {}, [], marked={"api", "db"})[0], "Démarrer/arrêter la sélection (2)")
+
+    def test_every_entry_maps_to_a_handled_key(self):
+        keys = {k for _, k in devctl.menu_items("api", self.services, self.groups, {"api": "up"}, [Path("/r")], ())}
+        self.assertLessEqual(keys, set(" lbpmas"))
+
+
+class PopupTest(unittest.TestCase):
+    def popup(self, keys):
+        import curses
+        from unittest import mock
+        win = mock.Mock(getch=mock.Mock(side_effect=keys))
+        scr = mock.Mock(getmaxyx=mock.Mock(return_value=(24, 80)))
+        with mock.patch.object(curses, "newwin", return_value=win):
+            return devctl.popup(scr, 3, 10, ["Démarrer", "Voir le terminal", "Pull"])
+
+    def test_arrows_then_enter(self):
+        import curses
+        self.assertEqual(self.popup([curses.KEY_DOWN, curses.KEY_DOWN, 10]), 2)
+
+    def test_wraps_up(self):
+        import curses
+        self.assertEqual(self.popup([curses.KEY_UP, 10]), 2)
+
+    def test_escape_cancels(self):
+        self.assertIsNone(self.popup([27]))

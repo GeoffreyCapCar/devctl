@@ -296,8 +296,7 @@ def pick(scr, title, items):
         scr.timeout(2000)
 
 ICONS = {"up": ("●", 1), "dead": ("✖", 2)}
-HELP = ("entrée start/stop · x cocher · l logs · a/s tout start/stop · "
-        "b branche · p pull · m rebase main · r refresh · q quitter")
+HELP = "entrée actions · espace start/stop · x cocher · r refresh · q quitter"
 
 
 def row_view(name, services, groups, states):
@@ -337,6 +336,52 @@ def draw(scr, rows, prefixes, cur, marked, services, groups, states, labels, msg
     scr.refresh()
 
 
+def menu_items(name, services, groups, states, repos, marked):
+    """(label, shortcut key) entries for the row's action menu; keys are the ones tui() handles."""
+    if marked:
+        items = [(f"Démarrer/arrêter la sélection ({len(marked)})", " ")]
+    elif name in groups:
+        all_up = all(states.get(m) == "up" for m in groups[name])
+        items = [("Arrêter le groupe" if all_up else "Démarrer le groupe", " ")]
+    else:
+        st = states.get(name)
+        items = [({"up": "Arrêter", "dead": "Relancer"}.get(st, "Démarrer"), " "),
+                 ("Voir les logs" if services[name].kind == "compose" else "Voir le terminal", "l")]
+    if len(repos) == 1:
+        items.append(("Changer de branche…", "b"))
+    if repos:
+        items += [("Pull", "p"), ("Rebase sur main…", "m")]
+    return items + [("Tout démarrer…", "a"), ("Tout arrêter…", "s")]
+
+
+def popup(scr, y, x, labels):
+    """Boxed menu near (y, x): arrows + Enter return the chosen index, Esc/q return None."""
+    h, w = scr.getmaxyx()
+    width, height = min(max(map(len, labels)) + 6, w), min(len(labels) + 2, h)
+    win = curses.newwin(height, width, max(0, min(y, h - height)), max(0, min(x, w - width)))
+    win.keypad(True)
+    cur = 0
+    try:
+        while True:
+            win.erase()
+            win.box()
+            for i, label in enumerate(labels[: height - 2]):
+                win.addnstr(i + 1, 1, ("▸ " if i == cur else "  ") + label, width - 2,
+                            curses.A_REVERSE if i == cur else 0)
+            win.refresh()
+            key = win.getch()
+            if key in (27, ord("q")):
+                return None
+            if key in (10, 13, curses.KEY_ENTER):
+                return cur
+            if key in (curses.KEY_UP, ord("k")):
+                cur = (cur - 1) % len(labels)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cur = (cur + 1) % len(labels)
+    finally:
+        scr.touchwin()  # the main screen doesn't know the popup painted over it
+
+
 def confirm(scr, show, question):
     show(f"{question} (y/n)")
     scr.timeout(-1)
@@ -373,6 +418,11 @@ def tui(scr, services, groups):
         show = lambda m: draw(scr, rows, prefixes, cur, marked, services, groups, states, labels, m)
         show(msg)
         key = scr.getch()
+        if key in (10, 13, curses.KEY_ENTER):
+            items = menu_items(rows[cur], services, groups, states, repos[rows[cur]],
+                               [r for r in rows if r in marked])
+            choice = popup(scr, min(cur, len(rows) - 1) + 3, 8 + len(prefixes[cur]), [l for l, _ in items])
+            key = -1 if choice is None else ord(items[choice][1])
         if key == ord("q"):
             return
         stale = key not in (curses.KEY_UP, ord("k"), curses.KEY_DOWN, ord("j"), ord("x"), curses.KEY_RESIZE)
@@ -382,7 +432,7 @@ def tui(scr, services, groups):
             cur = (cur + 1) % len(rows)
         elif key == ord("x"):
             marked ^= {rows[cur]}
-        elif key in (ord(" "), 10, 13, curses.KEY_ENTER):
+        elif key == ord(" "):
             targets = [r for r in rows if r in marked] or [rows[cur]]
             errors = apply(plan(targets, services, groups, states), show)
             marked.clear()
