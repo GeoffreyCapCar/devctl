@@ -66,6 +66,28 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self.names(["g", "a"], {}), [("start", "a"), ("start", "b")])
 
 
+class TuiGitTest(unittest.TestCase):
+    def test_git_keys_act_on_row_repo_and_refresh_labels_only_after_git(self):
+        import curses
+        from unittest import mock
+        repo = Path("/r")
+        keys = [ord("p"), curses.KEY_DOWN, curses.KEY_UP, ord("m"), ord("y"), ord("b"), ord("q")]
+        scr = mock.Mock(getch=mock.Mock(side_effect=keys), getmaxyx=mock.Mock(return_value=(24, 80)))
+        services = {"a": devctl.Service("a", {"dir": "/tmp", "cmd": "true"})}
+        m = dict(all_states=mock.Mock(return_value={}), row_repos=mock.Mock(return_value=[repo]),
+                 git_label=mock.Mock(return_value="⎇ main"), pull=mock.Mock(return_value=None),
+                 rebase_on_main=mock.Mock(return_value=None), branches=mock.Mock(return_value=["main", "feat"]),
+                 pick=mock.Mock(return_value="feat"), checkout=mock.Mock(return_value=None))
+        with mock.patch.multiple(curses, curs_set=mock.DEFAULT, use_default_colors=mock.DEFAULT,
+                                 init_pair=mock.DEFAULT, color_pair=mock.Mock(return_value=0)), \
+             mock.patch.multiple(devctl, **m):
+            devctl.tui(scr, services, {})
+        m["pull"].assert_called_once_with(repo)
+        m["rebase_on_main"].assert_called_once_with(repo)
+        m["checkout"].assert_called_once_with(repo, "feat")
+        self.assertEqual(m["git_label"].call_count, 4)  # startup + after p, m, b; not on arrows
+
+
 class LayoutTest(unittest.TestCase):
     def test_members_nested_under_group_then_ungrouped(self):
         services = {n: devctl.Service(n, {"dir": "/tmp", "cmd": "true"}) for n in "abc"}
@@ -150,3 +172,127 @@ class MainTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as e:
                 devctl.main(["--check"])
         self.assertIn("services.example.toml", str(e.exception.code))
+
+
+class GitTest(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start(); self.addCleanup(patcher.stop)
+        self.tmp = Path(tempfile.mkdtemp())
+        origin = self.tmp / "origin.git"
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(origin))
+        self.repo = self.tmp / "repo"
+        self.git(self.tmp, "init", "-q", "-b", "main", str(self.repo))
+        self.commit(self.repo, "a.txt", "1")
+        self.git(self.repo, "remote", "add", "origin", str(origin))
+        self.git(self.repo, "push", "-q", "-u", "origin", "main")
+        self.other = self.tmp / "other"  # a colleague's clone
+        self.git(self.tmp, "clone", "-q", str(origin), str(self.other))
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout
+
+    def commit(self, repo, name, content):
+        (repo / name).write_text(content)
+        self.git(repo, "add", name)
+        self.git(repo, "commit", "-q", "-m", f"{name}={content}")
+
+    def push_from_other(self, name, content, branch="main"):
+        self.git(self.other, "checkout", "-q", "-B", branch, "origin/main")
+        self.commit(self.other, name, content)
+        self.git(self.other, "push", "-q", "origin", f"{branch}:{branch}")
+
+    def branch(self):
+        return self.git(self.repo, "branch", "--show-current").strip()
+
+    def test_repo_of_subdir_and_non_repo(self):
+        (self.repo / "api").mkdir()
+        self.assertEqual(devctl.repo_of(self.repo / "api"), self.repo.resolve())
+        self.assertIsNone(devctl.repo_of(self.tmp))
+
+    def test_row_repos_dedupes_members(self):
+        (self.repo / "api").mkdir()
+        services = {"a": devctl.Service("a", {"dir": str(self.repo), "compose": True}),
+                    "b": devctl.Service("b", {"dir": str(self.repo / "api"), "npm": "dev"}),
+                    "c": devctl.Service("c", {"dir": str(self.tmp), "cmd": "true"})}
+        self.assertEqual(devctl.row_repos("g", services, {"g": ["a", "b", "c"]}), [self.repo.resolve()])
+
+    def test_label_shows_branch_and_dirty_marker(self):
+        self.assertEqual(devctl.git_label([self.repo]), "⎇ main")
+        (self.repo / "a.txt").write_text("changed")
+        self.assertEqual(devctl.git_label([self.repo]), "⎇ main *")
+
+    def test_label_multi_repo_names_each(self):
+        self.assertEqual(devctl.git_label([self.repo, self.other]), "⎇ repo:main · other:main")
+
+    def test_pull_fast_forwards(self):
+        self.push_from_other("b.txt", "2")
+        self.assertIsNone(devctl.pull(self.repo))
+        self.assertEqual((self.repo / "b.txt").read_text(), "2")
+
+    def test_pull_refuses_diverged_branch_without_merge_commit(self):
+        self.commit(self.repo, "local.txt", "x")
+        self.push_from_other("b.txt", "2")
+        self.assertIsNotNone(devctl.pull(self.repo))
+        self.assertEqual(self.git(self.repo, "rev-list", "--count", "HEAD").strip(), "2")
+
+    def test_rebase_on_main_updates_main_and_keeps_uncommitted_work(self):
+        self.git(self.repo, "checkout", "-q", "-b", "feat")
+        self.commit(self.repo, "f.txt", "feat")
+        (self.repo / "f.txt").write_text("wip")  # uncommitted -> autostash
+        self.push_from_other("c.txt", "main2")
+        self.assertIsNone(devctl.rebase_on_main(self.repo))
+        self.assertEqual(self.branch(), "feat")
+        self.assertEqual((self.repo / "c.txt").read_text(), "main2")
+        self.assertEqual((self.repo / "f.txt").read_text(), "wip")
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), self.git(self.repo, "rev-parse", "origin/main"))
+
+    def test_rebase_conflict_is_aborted(self):
+        self.git(self.repo, "checkout", "-q", "-b", "feat")
+        self.commit(self.repo, "a.txt", "feat")
+        self.push_from_other("a.txt", "main2")
+        err = devctl.rebase_on_main(self.repo)
+        self.assertIn("annulé", err)
+        self.assertEqual(self.branch(), "feat")
+        self.assertEqual((self.repo / "a.txt").read_text(), "feat")
+        self.assertFalse((self.repo / ".git" / "rebase-merge").exists())
+
+    def test_rebase_on_main_while_on_main_just_pulls(self):
+        self.push_from_other("b.txt", "2")
+        self.assertIsNone(devctl.rebase_on_main(self.repo))
+        self.assertEqual((self.repo / "b.txt").read_text(), "2")
+
+    def test_branches_include_remote_ones_and_checkout_tracks_them(self):
+        os.environ["GIT_COMMITTER_DATE"] = "2030-01-01T00:00:00"  # setUp commits share one second
+        self.push_from_other("x.txt", "1", branch="colleague")
+        self.git(self.repo, "fetch", "-q")
+        names = devctl.branches(self.repo)
+        self.assertEqual(names[0], "colleague")  # most recent first
+        self.assertIn("main", names)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertFalse({"HEAD", "origin", "origin/HEAD"} & set(names))
+        self.assertIsNone(devctl.checkout(self.repo, "colleague"))
+        self.assertEqual(self.branch(), "colleague")
+
+
+class PickTest(unittest.TestCase):
+    def pick(self, keys, items):
+        from unittest import mock
+        scr = mock.Mock(get_wch=mock.Mock(side_effect=keys), getmaxyx=mock.Mock(return_value=(24, 80)))
+        return devctl.pick(scr, "branche", items)
+
+    def test_filter_then_enter(self):
+        self.assertEqual(self.pick(["f", "e", "\n"], ["main", "feat/x", "fix"]), "feat/x")
+
+    def test_arrows_and_backspace(self):
+        import curses
+        self.assertEqual(self.pick(["z", "\x7f", curses.KEY_DOWN, "\n"], ["main", "feat/x"]), "feat/x")
+
+    def test_escape_cancels(self):
+        self.assertIsNone(self.pick(["\x1b"], ["main"]))
+
+    def test_enter_on_empty_result_cancels(self):
+        self.assertIsNone(self.pick(["z", "z", "\n"], ["main"]))

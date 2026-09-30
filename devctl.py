@@ -185,8 +185,119 @@ def apply(actions, show=print):
     return errors
 
 
+def git(repo, *args):
+    return sh("git", "-C", str(repo), *args)
+
+
+def repo_of(path):
+    r = git(path, "rev-parse", "--show-toplevel")
+    return Path(r.stdout.strip()).resolve() if r.returncode == 0 else None
+
+
+def row_repos(name, services, groups):
+    """Distinct git repos behind a row (group or service), in member order."""
+    repos = []
+    for s in expand(name, services, groups):
+        r = repo_of(s.dir)
+        if r and r not in repos:
+            repos.append(r)
+    return repos
+
+
+def branch_label(repo):
+    branch = git(repo, "branch", "--show-current").stdout.strip() or "(detached)"
+    dirty = git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+    return branch + (" *" if dirty else "")
+
+
+def git_label(repos):
+    if len(repos) == 1:
+        return "⎇ " + branch_label(repos[0])
+    return "⎇ " + " · ".join(f"{r.name}:{branch_label(r)}" for r in repos) if repos else ""
+
+
+def main_branch(repo):
+    r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if r.returncode == 0:
+        return r.stdout.strip().removeprefix("origin/")
+    for b in ("main", "master"):
+        if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}").returncode == 0:
+            return b
+    return "main"
+
+
+def pull(repo):
+    return error(git(repo, "pull", "--ff-only"))
+
+
+def rebase_on_main(repo):
+    """Update local main from origin, then rebase the current branch on it; abort on conflict."""
+    main = main_branch(repo)
+    if git(repo, "branch", "--show-current").stdout.strip() == main:
+        return pull(repo)
+    err = error(git(repo, "fetch", "origin", f"{main}:{main}"))
+    if err:
+        return err
+    if git(repo, "rebase", "--autostash", main).returncode:
+        git(repo, "rebase", "--abort")
+        return f"conflits avec {main}, rebase annulé (à faire à la main)"
+    return None
+
+
+def branches(repo):
+    """Local and origin branches, most recently committed first, without duplicates."""
+    r = git(repo, "for-each-ref", "--sort=-committerdate", "--format=%(refname:short)",
+            "refs/heads", "refs/remotes/origin")
+    names = []
+    for ref in r.stdout.splitlines():
+        name = ref.removeprefix("origin/")
+        if name not in ("HEAD", "origin") and name not in names:
+            names.append(name)
+    return names
+
+
+def checkout(repo, branch):
+    return error(git(repo, "checkout", branch))  # remote-only branch -> git creates the tracking branch
+
+
+def pick(scr, title, items):
+    """Filterable list: type to filter, arrows to move, Enter picks, Esc cancels (None)."""
+    query, cur = "", 0
+    scr.timeout(-1)
+    try:
+        while True:
+            shown = [i for i in items if query.lower() in i.lower()]
+            cur = min(cur, max(0, len(shown) - 1))
+            h, w = scr.getmaxyx()
+            top = max(0, cur - (h - 4))
+            scr.erase()
+            try:
+                scr.addnstr(0, 0, f"{title} — tape pour filtrer : {query}", w - 1, curses.A_BOLD)
+                for i, item in enumerate(shown[top: top + h - 3]):
+                    scr.addnstr(i + 2, 2, item, w - 3, curses.A_REVERSE if top + i == cur else 0)
+                scr.addnstr(h - 1, 0, "↑↓ choisir · entrée valider · esc annuler", w - 1, curses.A_DIM)
+            except curses.error:
+                pass
+            scr.refresh()
+            key = scr.get_wch()
+            if key == "\x1b":
+                return None
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                return shown[cur] if shown else None
+            if key == curses.KEY_UP:
+                cur = max(0, cur - 1)
+            elif key == curses.KEY_DOWN:
+                cur += 1
+            elif key in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                query, cur = query[:-1], 0
+            elif isinstance(key, str) and key.isprintable():
+                query, cur = query + key, 0
+    finally:
+        scr.timeout(2000)
+
 ICONS = {"up": ("●", 1), "dead": ("✖", 2)}
-HELP = "entrée/espace start/stop · x cocher · l logs · a tout démarrer · s tout arrêter · r refresh · q quitter"
+HELP = ("entrée start/stop · x cocher · l logs · a/s tout start/stop · "
+        "b branche · p pull · m rebase main · r refresh · q quitter")
 
 
 def row_view(name, services, groups, states):
@@ -208,7 +319,7 @@ def layout(services, groups):
     return rows + [(n, "") for n in services if n not in grouped]
 
 
-def draw(scr, rows, prefixes, cur, marked, services, groups, states, msg):
+def draw(scr, rows, prefixes, cur, marked, services, groups, states, labels, msg):
     scr.erase()
     h, w = scr.getmaxyx()
     try:
@@ -219,11 +330,29 @@ def draw(scr, rows, prefixes, cur, marked, services, groups, states, msg):
             scr.addnstr(i + 2, 0, "[x] " if name in marked else "[ ] ", w - 1, rev)
             scr.addstr(prefixes[i], rev)
             scr.addstr(icon, curses.color_pair(color) | rev)
-            scr.addnstr(f" {name:<{28 - len(prefixes[i])}} {info}", max(0, w - 10), rev)
+            scr.addnstr(f" {name:<{28 - len(prefixes[i])}} {info:<8} {labels.get(name, '')}", max(0, w - 10), rev)
         scr.addnstr(h - 1, 0, msg, w - 1, curses.A_DIM)
     except curses.error:
         pass  # terminal too small
     scr.refresh()
+
+
+def confirm(scr, show, question):
+    show(f"{question} (y/n)")
+    scr.timeout(-1)
+    ok = scr.getch() == ord("y")
+    scr.timeout(2000)
+    return ok
+
+
+def git_each(repos, action, show, verb):
+    errors = []
+    for r in repos:
+        show(f"{verb} {r.name}…")
+        err = action(r)
+        if err:
+            errors.append(f"{r.name}: {err}")
+    return errors
 
 
 def tui(scr, services, groups):
@@ -233,11 +362,15 @@ def tui(scr, services, groups):
         curses.init_pair(i, c, -1)
     scr.timeout(2000)
     rows, prefixes = map(list, zip(*layout(services, groups)))
-    cur, marked, msg, stale = 0, set(), HELP, True
+    repos = {name: row_repos(name, services, groups) for name in set(rows)}
+    cur, marked, msg, stale, git_stale = 0, set(), HELP, True, True
     while True:
         if stale:  # only on timer/actions: refreshing per keypress makes held arrows lag
             states, stale = all_states(services), False
-        show = lambda m: draw(scr, rows, prefixes, cur, marked, services, groups, states, m)
+        if git_stale:  # git status is slow on big repos: only at startup, after git actions and on r
+            labels = {n: git_label(repos[n]) for n, p in zip(rows, prefixes) if not p}
+            git_stale = False
+        show = lambda m: draw(scr, rows, prefixes, cur, marked, services, groups, states, labels, m)
         show(msg)
         key = scr.getch()
         if key == ord("q"):
@@ -262,13 +395,29 @@ def tui(scr, services, groups):
                 curses.endwin()
                 s.engine.logs(s)
                 scr.refresh()
+        elif key == ord("r"):
+            git_stale = True
+        elif key in (ord("b"), ord("p"), ord("m")):
+            row_repo = repos[rows[cur]]
+            errors = []
+            if not row_repo:
+                errors = [f"{rows[cur]} : pas dans un repo git"]
+            elif key == ord("p"):
+                errors = git_each(row_repo, pull, show, "pull")
+            elif key == ord("m"):
+                if confirm(scr, show, f"Mettre à jour main et rebaser {rows[cur]} dessus ?"):
+                    errors = git_each(row_repo, rebase_on_main, show, "rebase")
+            elif len(row_repo) > 1:
+                errors = [f"{rows[cur]} : plusieurs repos, choisis la ligne d'un service"]
+            else:
+                branch = pick(scr, f"branche de {row_repo[0].name}", branches(row_repo[0]))
+                if branch:
+                    errors = git_each(row_repo, lambda r: checkout(r, branch), show, f"checkout {branch}")
+            git_stale = True
+            msg = " · ".join(errors) or HELP
         elif key in (ord("a"), ord("s")):
             start = key == ord("a")
-            show(f"Tout {'démarrer' if start else 'arrêter'} ? (y/n)")
-            scr.timeout(-1)
-            ok = scr.getch() == ord("y")
-            scr.timeout(2000)
-            if ok:
+            if confirm(scr, show, f"Tout {'démarrer' if start else 'arrêter'} ?"):
                 actions = [("start" if start else "stop", s) for s in services.values()
                            if (states.get(s.name) != "up" if start else s.name in states)]
                 msg = " · ".join(apply(actions, show)) or HELP
@@ -307,6 +456,7 @@ def main(argv):
     if argv:
         sys.exit("usage: devctl [--check | up NOM... | down NOM...]")
     locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")  # Esc in the branch picker without curses' 1 s delay
     curses.wrapper(tui, services, groups)
 
 
