@@ -252,15 +252,18 @@ def rebase_on_main(repo):
 
 
 def branches(repo):
-    """Local and origin branches, most recently committed first, without duplicates."""
-    r = git(repo, "for-each-ref", "--sort=-committerdate", "--format=%(refname:short)",
+    """Local and origin branches, mine (last commit authored by me) first, each part most recently
+    committed first, without duplicates."""
+    me = git(repo, "var", "GIT_AUTHOR_IDENT").stdout.partition("<")[2].partition(">")[0]
+    r = git(repo, "for-each-ref", "--sort=-committerdate", "--format=%(refname:short) %(authoremail)",
             "refs/heads", "refs/remotes/origin")
-    names = []
-    for ref in r.stdout.splitlines():
+    mine, others = [], []
+    for line in r.stdout.splitlines():
+        ref, _, email = line.partition(" ")
         name = ref.removeprefix("origin/")
-        if name not in ("HEAD", "origin") and name not in names:
-            names.append(name)
-    return names
+        if name not in ("HEAD", "origin") and name not in mine + others:
+            (mine if email == f"<{me}>" else others).append(name)
+    return mine + others
 
 
 def worktrees(repo):

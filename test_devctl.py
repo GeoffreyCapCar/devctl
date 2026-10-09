@@ -288,6 +288,19 @@ class GitTest(GitFixture):
         self.assertIsNone(devctl.checkout(self.repo, "colleague"))
         self.assertEqual(self.branch(), "colleague")
 
+    def test_my_branches_come_first(self):
+        self.git(self.repo, "checkout", "-q", "-b", "mine")
+        os.environ["GIT_COMMITTER_DATE"] = "2029-01-01T00:00:00"
+        self.commit(self.repo, "m.txt", "1")
+        os.environ["GIT_COMMITTER_DATE"] = "2030-01-01T00:00:00"
+        os.environ["GIT_AUTHOR_EMAIL"] = "colleague@t"
+        self.push_from_other("x.txt", "1", branch="colleague")
+        os.environ["GIT_AUTHOR_EMAIL"] = "t@t"
+        self.git(self.repo, "fetch", "-q")
+        names = devctl.branches(self.repo)
+        self.assertEqual(names[:2], ["mine", "main"])  # mine, most recent first, before the newer colleague one
+        self.assertEqual(names[-1], "colleague")
+
 
 class PickTest(unittest.TestCase):
     def pick(self, keys, items):
